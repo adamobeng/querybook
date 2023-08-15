@@ -4,6 +4,7 @@ from lib.elasticsearch.query_utils import (
     order_by_fields,
     combine_keyword_and_filter_query,
 )
+import hashlib
 
 FILTERS_TO_AND = ["tags", "data_elements"]
 
@@ -89,13 +90,49 @@ def construct_tables_query(
     else:
         keywords_query = {"match_all": {}}
 
+    #  Assign each query to one of a number of experimental conditions
+    #  with different scoring functions
+
+    #  Mapping from score script to percentage of query traffic to assign
+    experiment_versions = {
+        "doc['importance_score'].value * 10 + (doc['golden'].value ? 10 : 0)": 50,
+        "doc['importance_score'].value * 10 + (doc['golden'].value ? 100 : 0)": 50,
+    }
+
+    #  Construct an elasticsearch Painless script which checks the experiment_version
+    #  and computes the score using the relevant version's script
+    control_version = list(experiment_versions.keys())[0]
+    source = f"\nif (params.get('experiment_version') == 0) {{\n\t{control_version}\n}}"
+    for v in list(experiment_versions.keys())[1:]:
+        source += f"\nelse if (params.get('experiment_version') == 1) {{\n\t{v}\n}}"
+    source += f"\nelse {{\n\t{control_version}\n}}"  # Fall back to first version (should not be needed)
+
+    #  Use the md5 hash of the query as a pseudorandom way of assigning an experiment version
+    numberline_position = int.from_bytes(
+        hashlib.md5(query.encode("utf-8")).digest(), "big", signed=False
+    ) % sum(experiment_versions.values())
+
+    #  Determine in which experiment version's range the hashed value falls
+    percentages = list(experiment_versions.values())
+    cumulative_percentages = [percentages[0]]
+    for p in percentages[1:]:
+        cumulative_percentages.append(p + cumulative_percentages[-1])
+    version = [
+        i for i, c in enumerate(cumulative_percentages) if numberline_position < c
+    ][0]
+
     keywords_query = {
         "function_score": {
             "query": keywords_query,
             "boost_mode": "sum",
             "script_score": {
                 "script": {
-                    "source": "doc['importance_score'].value * 10 + (doc['golden'].value ? 10 : 0)"
+                    "source": source,
+                    "params": {
+                        #  It's more efficient to have a single parametrized script than different scoring scripts
+                        #  for different queries
+                        "experiment_version": version,
+                    },
                 }
             },
         }
